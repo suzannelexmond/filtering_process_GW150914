@@ -1,0 +1,243 @@
+
+import scipy.signal as sig
+import numpy as np
+import matplotlib.pyplot as plt
+import h5py
+from scipy.interpolate import interp1d
+from scipy.signal import butter, filtfilt, iirdesign, zpk2tf, freqz, iirnotch
+
+#Template import
+plt.figure()
+temp_time, temp_H1 = np.genfromtxt('GW150914_4_NR_waveform.txt').transpose()
+plt.title(' Template GW150914')
+plt.xlabel('Time [s]')
+plt.ylabel('Strain')
+plt.plot(temp_time, temp_H1)
+plt.savefig('template.png')
+
+
+#LIGO data for Livingston and Hanford
+fs = 4096
+dataFile = h5py.File('GW150914_L1.hdf5')
+data_L1 = dataFile['strain/Strain'][...]
+dataFile.close()
+
+dataFile = h5py.File('GW150914_H1.hdf5')
+data_H1 = dataFile['strain/Strain'][...]
+dataFile.close()
+
+#Time array
+time = np.arange(0, 32, 1./fs)
+dt = time[1] - time[0]
+print(len(temp_time), len(time))
+#Plot unfiltered data of Livingston and Hanford
+plt.figure()
+plt.plot(time, data_L1, label= 'Livingston', linewidth = 0.7)
+plt.plot(time, data_H1, label = 'Hanford', linewidth = 0.7)
+plt.title('Unfiltered data LIGO')
+plt.xlabel('time [s]')
+plt.ylabel('strain')
+plt.ylim(-2*10**(-18), 1.5*10**(-18))
+plt.xlim(0, 32)
+plt.legend()
+plt.savefig('Unfiltered_data.png')
+
+
+# Plot PSD
+plt.figure()
+power_data_L1, freq_psd_L1 = plt.psd(data_L1, Fs=fs, NFFT=fs, visible=False)
+power_data_H1, freq_psd_H1 = plt.psd(data_H1, Fs=fs, NFFT=fs, visible=False)
+
+
+plt.xlim([10, 2048]) #Nyquist frequency = 2048, Below fs = 10 data is not properly calibrated.
+plt.xlabel('Frequency (Hz)')
+plt.ylabel('ASD (strain$\mathregular{^2}$/Hz)')
+plt.grid('on')
+plt.loglog(freq_psd_L1, np.sqrt(power_data_L1), 'b', label = 'L1', linewidth = 0.8)
+plt.loglog(freq_psd_H1, np.sqrt(power_data_H1), 'r', label = 'H1', linewidth = 0.8)
+plt.legend()
+plt.savefig('ASD.png')
+
+#interpolated PSD for later use in the whitening filter
+psd_H1 = interp1d(freq_psd_H1, power_data_H1)
+psd_L1 = interp1d(freq_psd_L1, power_data_L1)
+
+"""
+Only the data between 10 and 2000 Hz has been plotted. Below 10 Hz the data is not properly calibrated. However this is not a problem
+since the noise to high for LIGO to sense the gravitational wave signal.
+Above 2000 Hz the data is not reliable because the Nyquist frequency = fs/2 = 2048 Hz. 
+LIGO only has a detectable frequency range of 20-300 Hz so this again is not an issue.
+
+The strong spectral lines in the ASD are the result of instrumental noise which can be caused by resonance of the mirrors (500 Hz and the harmonics). 
+Some harmonics are unwanted (60 Hz and harmonics).
+
+Since the signal is weak compared to the noise and lasts shorter than a second, the signal can't be seen in the ASD.
+"""
+
+
+# function to whiten data
+def whiten(strain, interp_psd, dt):
+    Nt = len(strain)
+    freqs = np.fft.rfftfreq(Nt, dt)
+
+    # whitening: transform to freq domain, divide by asd, then transform back, 
+    # taking care to get normalization right.
+    hf = np.fft.rfft(strain)
+    white_hf = hf / (np.sqrt(interp_psd(freqs) /dt/2.))
+    white_ht = np.fft.irfft(white_hf, n=Nt)
+    return white_ht
+
+# now whiten the data from H1 and L1, and also the NR template:
+data_H1_whiten = whiten(data_H1,psd_H1,dt)
+data_L1_whiten = whiten(data_L1,psd_L1,dt)
+temp_H1_whiten = whiten(temp_H1,psd_H1,dt)
+
+#plot ASD of whitened data
+plt.figure()
+power_data_L1_w, freq_psd_L1_w = plt.psd(data_L1_whiten, Fs=fs, NFFT=fs, visible=False)
+power_data_H1_w, freq_psd_H1_w = plt.psd(data_H1_whiten, Fs=fs, NFFT=fs, visible=False)
+
+
+plt.xlim([10, 2048]) #Nyquist frequency = 2048, Below fs = 10 data is not properly calibrated.
+plt.xlabel('Frequency (Hz)')
+plt.ylabel('ASD (strain$\mathregular{^2}$/Hz)')
+plt.grid('on')
+plt.loglog(freq_psd_L1_w, np.sqrt(power_data_L1_w), 'b', label = 'L1', linewidth = 0.8)
+plt.loglog(freq_psd_H1_w, np.sqrt(power_data_H1_w), 'r', label = 'H1', linewidth = 0.8)
+plt.legend()
+plt.savefig('ASD_whitened.png')
+
+
+#High frequency bandpass filter
+(b, a) = sig.butter(4, [20/(fs/2.0), 300/(fs/2.0)], btype= 'pass')
+filtered_signal_L1 = sig.lfilter(b, a, data_L1_whiten) #data_L1_whiten
+filtered_signal_H1 = sig.lfilter(b, a, data_H1_whiten) #data_H1_whiten
+filtered_signal_temp = sig.lfilter(b, a, temp_H1_whiten) #template whiten
+
+#Shifting of L1 by 7 ms and inverted.
+strain_L1_shift = -np.roll(filtered_signal_L1,int(0.007*fs))
+
+"""
+The template is not yet placed at the right time around the event. To fix this it is important to first look at the time of the event.
+The template has reached it's maximum at exactly 0.0 seconds. The event of the template needs to be equal to the event of H1 and L1.
+"""
+# Determinign time of event
+#print(len(temp_time))
+#time_event = len(time)/32*15.4298
+
+plt.figure()
+plt.ylim([-4, 4])
+plt.xlim(15.3, 15.5)
+plt.xlabel('time (s)')
+plt.ylabel('Amplitude (strain)')
+plt.plot(time, strain_L1_shift, 'r', label = 'Livingston', linewidth = 1)
+plt.plot(time, filtered_signal_H1, 'g', label = 'Hanford', linewidth = 1)
+#plt.plot(temp_time + 15.4227 , filtered_signal_temp, 'k', label = 'Template', linewidth = 0.9)
+#plt.title('filtered signal')
+plt.legend()
+plt.savefig('Filtered_data.png')
+
+#Zoom-out to see clear view of signal 
+plt.figure()
+plt.xlabel('time (s)')
+plt.ylabel('Amplitude (strain)')
+plt.plot(time, filtered_signal_L1, 'r', label = 'Livingston')
+#plt.plot(time, filtered_signal_H1, 'g', label = 'Hanford')
+#plt.plot(temp_time + 15.4227, filtered_signal_temp, 'k', label = 'Template')
+#plt.title('filtered signal')
+plt.legend()
+plt.savefig('Filtered_data_zoomout_Livingston.png')
+
+
+##Define the notch filter
+def notch_filter(f, Q, fs):
+    #f = frequency for the notch filter, Q= qualtity factor, fs= sample frequecy
+    b,a = sig.iirnotch(f, Q, fs)
+    return b, a
+
+##Define the coefficients of the filter
+def filter_coefs(fs):
+    #fs = sample frequency
+    coefs = []
+    
+    #Notches can be determined by looking at peaks from ASD
+    #notches = np.array([14.0,34.70, 35.30, 35.90, 36.70, 37.30, 40.95, 60.00, 120.00, 179.99, 304.99, 331.49, 510.02, 1009.99])
+    notches = np.array([13.8, 33.7, 34.7, 35.3, 35.9, 36.7, 37.3, 331.9, 1038.7, 300, 600, 900, 500, 1000, 1500, 60, 120, 180 ])
+    
+    for notch in notches:                     
+        b, a = notch_filter(notch, 10, fs)
+        coefs.append((b, a))
+  
+        return coefs
+#
+##Define function that filters the data with notch filters
+def filter_data_notch(strain, coefs):
+    data = strain.copy()
+    for coef in coefs:
+        b,a = coef
+        # filtfilt applies a linear filter twice, once forward and once backwards.
+        # The combined filter has linear phase.
+        data = filtfilt(b, a, data)
+    return data
+#
+##Filtered the data with notch filters
+filtered_notch_H1 = filter_data_notch(filtered_signal_H1, filter_coefs(fs))
+filtered_notch_L1 = filter_data_notch(strain_L1_shift, filter_coefs(fs))
+filtered_notch_temp = filter_data_notch(filtered_signal_temp, filter_coefs(fs))
+
+plt.figure()
+plt.ylim([-4, 4])
+plt.xlim(15.3, 15.5)
+plt.xlabel('time')
+plt.ylabel('Amplitude [strain]')
+plt.plot(time, filtered_notch_L1, label = 'Livingston')
+plt.plot(time, filtered_notch_H1, label = 'Hanford')
+plt.plot(temp_time + 15.4277 - 0.0053, filtered_notch_temp, label = 'Template')
+plt.title('filtered signal')
+plt.legend()
+
+plt.figure()
+power_data_L1_n, freq_psd_L1_n = plt.psd(filtered_notch_L1, Fs=fs, NFFT=fs, visible=False)
+power_data_H1_n, freq_psd_H1_n = plt.psd(filtered_notch_H1, Fs=fs, NFFT=fs, visible=False)
+
+
+plt.xlim([10, 2048]) #Nyquist frequency = 2048, Below fs = 10 data is not properly calibrated.
+plt.xlabel('Frequency (Hz)')
+plt.ylabel('ASD (strain$\mathregular{^2}$/Hz)')
+plt.grid('on')
+plt.loglog(freq_psd_L1_n, np.sqrt(power_data_L1_n), 'b', label = 'L1', linewidth = 0.8)
+plt.loglog(freq_psd_H1_n, np.sqrt(power_data_H1_n), 'r', label = 'H1', linewidth = 0.8)
+plt.legend()
+plt.savefig('ASD_notched.png')
+
+
+#Spectogram (plots time in y-axis and frequency in x-axis. Also brightens
+# the area for higher energies.)
+
+NFFT = 200
+NOVL = NFFT/16*15
+window = np.blackman(NFFT)
+
+#The lines at 500, 1000, 1500 and 2000 Hz are harmonics of the vibers holding up the mirrors of the interferometers.
+#There is some power present under 20 Hz but the signal is so small to see. For this we zoom in on the signal.
+
+
+spec_cmap = 'viridis'
+
+plt.figure()
+power_spec_H1, freq_H1, time, image_axis = plt.specgram(filtered_signal_H1, NFFT = NFFT, Fs = fs, window = window, noverlap = NOVL, cmap = spec_cmap )
+plt.xlabel('Time [s]')
+plt.ylabel('Frequency [Hz]')
+plt.title('Spectogram H1')
+plt.colorbar()
+plt.axis([15, 16, 0, 500])
+plt.savefig('spectrogram_H1.png')
+
+plt.figure()
+power_spec_L1, freq_L1, time, image_axis = plt.specgram(strain_L1_shift, NFFT = NFFT, Fs = fs, window = window, noverlap = NOVL, cmap = spec_cmap )
+plt.xlabel('Time [s]')
+plt.ylabel('Frequency [Hz]')
+plt.title('Spectogram L1')
+plt.colorbar()
+plt.axis([15, 16, 0, 500])
+plt.savefig('spectrogram_L1.png')
